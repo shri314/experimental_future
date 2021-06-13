@@ -1,0 +1,467 @@
+// vim: filetype=cpp
+#include <future>
+#include <functional>
+#include <type_traits>
+
+namespace std::experimental {
+
+   template<class T>
+   class future_t;
+
+   template<class T>
+   class shared_future_t;
+
+   template<class R>
+   class promise_t;
+
+   //////////////////////////////////////////////////////////////////////////
+
+   namespace detail {
+
+      template<class T>
+      struct unwrapped_result_of_t {
+         using type = T;
+      };
+
+      template<class R>
+      struct unwrapped_result_of_t<future_t<R>> {
+         using type = typename unwrapped_result_of_t<R>::type;
+      };
+
+      template<class R>
+      struct unwrapped_result_of_t<shared_future_t<R>> {
+         using type = typename unwrapped_result_of_t<R>::type;
+      };
+
+      template<class R>
+      struct unwrapped_result_of_t<std::future<R>> {
+         //such an unwrapping not supported:
+         //using type = typename unwrapped_result_of_t<R>::type;
+      };
+
+      template<class R>
+      struct unwrapped_result_of_t<std::shared_future<R>> {
+         //such an unwrapping not supported:
+         //using type = typename unwrapped_result_of_t<R>::type;
+      };
+
+      //////////////////////////////////////////////////////////////////////////
+
+      template<class R, class Func>
+      auto make_promise_keeper_(promise_t<R>&& prom, Func func) {
+         return [prom = std::move(prom), func = std::move(func)]() mutable {
+            try {
+               if constexpr ( std::is_void_v<R> ) {
+                  func();
+                  prom.set_value();
+               }
+               else {
+                  prom.set_value( func() );
+               }
+            }
+            catch(...) {
+               prom.set_exception( std::current_exception() );
+            }
+         };
+      }
+
+      //////////////////////////////////////////////////////////////////////////
+
+      template<class F>
+      class unique_function_t;
+
+      template<class R, class... Args>
+      class unique_function_t<R(Args...)> {
+         struct invokable_base_t {
+            virtual R invoke(Args...) = 0;
+            virtual ~invokable_base_t() = default;
+         };
+
+         template<class F>
+         struct concrete_invokable_t final : invokable_base_t {
+            concrete_invokable_t(F&& foo)
+               : m_foo(std::move(foo))
+            {
+            }
+
+         private:
+            R invoke(Args... args) override {
+               return m_foo(std::forward<Args>(args)...);
+            }
+
+         private:
+            F m_foo;
+         };
+
+      public:
+         unique_function_t() = default;
+
+         template<class F>
+         explicit unique_function_t(F foo)
+            : m_invo{ std::make_unique<concrete_invokable_t<F>>(std::forward<F>(foo)) }
+         {
+         }
+
+         unique_function_t(unique_function_t&& other)
+            : m_invo{ std::move(other.m_invo) }
+         {
+         }
+
+         unique_function_t(const unique_function_t&) = delete;
+
+         unique_function_t& operator=(unique_function_t&& other)
+         {
+            m_invo = std::move(other.m_invo);
+            return *this;
+         }
+
+         unique_function_t& operator=(const unique_function_t&) = delete;
+
+         explicit operator bool() const noexcept {
+            return static_cast<bool>(m_invo);
+         }
+
+         R operator()(Args... args) {
+            return m_invo->invoke(std::forward<Args>(args)...);
+         }
+
+      private:
+         std::unique_ptr<invokable_base_t> m_invo;
+      };
+
+      //////////////////////////////////////////////////////////////////////////
+
+      class extra_state_t final {
+         std::atomic<bool> m_ready;
+         unique_function_t<void()> m_callback;
+         std::mutex m_mutex;
+
+      public:
+         extra_state_t() noexcept
+            : m_ready{false}
+         {
+         }
+
+         ~extra_state_t() = default;
+
+         extra_state_t(const extra_state_t&) = delete;
+         extra_state_t(extra_state_t&&) = delete;
+         extra_state_t& operator=(const extra_state_t&) = delete;
+         extra_state_t& operator=(extra_state_t&&) = delete;
+
+         bool is_ready() const {
+            return m_ready;
+         }
+
+         void set_ready() {
+            m_ready = true;
+         }
+
+      public:
+         template<class Fut, class Cont>
+         auto get_continuity_future(Fut fut, Cont cont)
+         {
+            using R = typename detail::unwrapped_result_of_t<decltype(cont( std::move(fut) ))>::type;
+
+            promise_t<R> prom;
+
+            auto fu = prom.get_future();
+
+            std::scoped_lock lk{m_mutex};
+            m_callback = unique_function_t<void()>{
+                           detail::make_promise_keeper_(
+                              std::move(prom),
+                              [fut = std::move(fut), cont = std::move(cont)]() mutable {
+                                 return cont( std::move(fut) );
+                              }
+                           )
+                        };
+
+            if(this->is_ready()) {
+               m_callback();
+            }
+
+            return fu;
+         }
+
+         void invoke_continuation() {
+            std::scoped_lock lk{m_mutex};
+            if(m_callback) {
+               m_callback();
+            }
+         }
+      };
+   }
+
+   //////////////////////////////////////////////////////////////////////////
+
+   template<class T>
+   class future_t
+   {
+      friend promise_t<T>;
+
+   private:
+      explicit future_t(std::future<T>&& fut, std::shared_ptr<detail::extra_state_t> exst) noexcept
+         : m_impl{std::move(fut)}
+         , m_exst{exst} {
+      }
+
+   public:
+      future_t() noexcept { }
+
+      future_t(const future_t&) = delete;
+
+      future_t(future_t&& other) noexcept
+         : m_impl{std::move(other.m_impl)}
+         , m_exst{std::move(other.m_exst)}
+      {
+      }
+
+      ~future_t() = default;
+
+      //////////////////////////////////
+
+      future_t& operator=(future_t&& other) noexcept {
+         m_impl = std::move(other.m_impl);
+         return *this;
+      }
+
+      future_t& operator=(const future_t& other) = delete;
+
+      //////////////////////////////////
+
+      // FIXME: incomplete
+      //shared_future_t<T> share() noexcept {
+      //   return shared_future_t<T>{ std::move(m_impl.share()) };
+      //}
+
+      //////////////////////////////////
+
+      decltype(auto) get() {
+         return m_impl.get();
+      }
+
+      //////////////////////////////////
+
+      bool valid() const noexcept {
+         return m_impl.valid();
+      }
+
+      //////////////////////////////////
+
+      void wait() const {
+         m_impl.wait();
+      }
+
+      template<class Rep, class Period>
+      std::future_status wait_for( const std::chrono::duration<Rep,Period>& timeout_duration ) const {
+         return m_impl.wait_for(timeout_duration);
+      }
+
+      template<class Clock, class Duration>
+      std::future_status wait_until( const std::chrono::time_point<Clock,Duration>& timeout_time ) const {
+         return m_impl.wait_until(timeout_time);
+      }
+
+      //////////////////////////////////
+
+      template<class Cont>
+      auto then(Cont cont) && {
+         return m_exst->get_continuity_future(std::move(m_impl), std::move(cont));
+      }
+
+      template<class Cont>
+      void then(Cont cont) & = delete;
+
+      bool is_ready() const {
+         return m_exst->is_ready();
+      }
+
+   private:
+      std::future<T> m_impl;
+      std::shared_ptr<detail::extra_state_t> m_exst;
+   };
+
+   //////////////////////////////////////////////////////////////////////////
+
+   //template<class T>
+   //class shared_future_t
+   //{
+   //   friend future_t<T>;
+   //
+   //private:
+   //   explicit shared_future_t( std::shared_future<T>&& sf ) noexcept
+   //      : m_impl{ std::move(sf) }
+   //   {
+   //   }
+   //
+   //private:
+   //   std::shared_future<T> m_impl;
+   //};
+
+   //////////////////////////////////////////////////////////////////////////
+
+   template<class R>
+   class promise_t
+   {
+   public:
+      promise_t()
+         : m_impl{}
+         , m_exst{std::make_shared<detail::extra_state_t>()}
+      {
+      }
+
+      template<class Alloc>
+      promise_t(std::allocator_arg_t a, const Alloc& alloc)
+         : m_impl{a, alloc}
+         , m_exst{std::allocate_shared<detail::extra_state_t>(alloc)}
+      {
+      }
+
+      promise_t(const promise_t&) = delete;
+
+      promise_t(promise_t&& other) noexcept
+         : m_impl{std::move(other.m_impl)}
+         , m_exst{std::move(other.m_exst)}
+      {
+      }
+
+      ~promise_t() = default;
+
+      //////////////////////////////////
+
+      promise_t& operator=(promise_t&& other) noexcept {
+         m_impl = std::move(other.m_impl);
+         m_exst = std::move(other.m_exst);
+         return *this;
+      }
+
+      promise_t& operator=(const promise_t& other) = delete;
+
+      //////////////////////////////////
+
+      void swap(promise_t& other) noexcept {
+         promise_t temp{ std::move(*this) };
+         *this = std::move(*other);
+         other = std::move(temp);
+      }
+
+      //////////////////////////////////
+
+      future_t<R> get_future() {
+         return future_t<R>{ std::move(m_impl.get_future()), m_exst };
+      }
+
+      //////////////////////////////////
+
+      template<
+         class V,
+         class = typename std::enable_if_t< !std::is_void_v<V> >
+      >
+      void set_value(const V& value) {
+         m_exst->set_ready();
+         m_impl.set_value( value );
+         m_exst->invoke_continuation();
+      }
+
+      template<
+         class V,
+         class = typename std::enable_if_t< !std::is_void_v<typename std::decay_t<V>> >
+      >
+      void set_value(V&& value) {
+         m_exst->set_ready();
+         m_impl.set_value( std::forward<V>(value) );
+         m_exst->invoke_continuation();
+      }
+
+      template<
+         class V = R,
+         class = typename std::enable_if_t< std::is_void_v<V> >
+      >
+      void set_value() {
+         m_exst->set_ready();
+         m_impl.set_value();
+         m_exst->invoke_continuation();
+      }
+
+      //////////////////////////////////
+
+      template<
+         class V,
+         class = typename std::enable_if_t< !std::is_void_v<V> >
+      >
+      void set_value_at_thread_exit(const V& value) {
+         m_exst->set_ready();
+         m_impl.set_value_at_thread_exit( value );
+         m_exst->invoke_continuation();
+      }
+
+      template<
+         class V,
+         class = typename std::enable_if_t< !std::is_void_v<typename std::decay_t<V>> >
+      >
+      void set_value_at_thread_exit(V&& value) {
+         m_exst->set_ready();
+         m_impl.set_value_at_thread_exit( std::forward<V>(value) );
+         m_exst->invoke_continuation();
+      }
+
+      template<
+         class V = R,
+         class = typename std::enable_if_t< std::is_void_v<V> >
+      >
+      void set_value_at_thread_exit() {
+         m_exst->set_ready();
+         m_impl.set_value_at_thread_exit();
+         m_exst->invoke_continuation();
+      }
+
+      //////////////////////////////////
+
+      void set_exception(std::exception_ptr ex) {
+         m_exst->set_ready();
+         m_impl.set_exception(ex);
+         m_exst->invoke_continuation();
+      }
+
+      void set_exception_at_thread_exit(std::exception_ptr ex) {
+         m_exst->set_ready();
+         m_impl.set_exception_at_thread_exit(ex);
+         m_exst->invoke_continuation();
+      }
+
+   private:
+      std::promise<R> m_impl;
+      std::shared_ptr<detail::extra_state_t> m_exst;
+   };
+
+   template<class Func, class... Args>
+   auto async_do(Func func, Args&&... args) {
+
+      using R = typename detail::unwrapped_result_of_t< decltype(std::bind(std::move(func), std::forward<Args>(args)...)()) >::type;
+
+      promise_t<R> prom;
+
+      future_t<R> fut = prom.get_future();
+
+      std::thread(
+               detail::make_promise_keeper_(
+                  std::move(prom),
+                  std::bind(std::move(func), std::forward<Args>(args)...)
+               )
+            ).detach();
+
+      return fut;
+   }
+
+   template<class T>
+   using future = future_t<T>;
+
+   template<class T>
+   using promise = future_t<T>;
+}
+
+namespace std {
+   template<class R, class Alloc>
+   struct uses_allocator<experimental::promise_t<R>, Alloc> : std::uses_allocator<std::promise<R>, Alloc> { };
+}
